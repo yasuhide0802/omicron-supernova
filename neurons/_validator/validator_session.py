@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 from utils import AutoUpdate, clean_temp_files
 
+
 # The maximum time miners can take to respond to requests
 VALIDATOR_REQUEST_TIMEOUT_SECONDS = 30
 # The maximum number of concurrent requests
@@ -25,6 +26,9 @@ MAXIMUM_SCORE_MEDIAN_SAMPLE = 0.05
 # Shift in seconds to apply to the minimum response time for vertical asymptote adjustment
 MINIMUM_SCORE_SHIFT = 0.5
 
+VALIDATOR_SHOULD_QUERY_EACH_BATCH_X_TIMES_PER_EPOCH = 2
+PSEUDO_SHUFFLE_EVERY_X_BLOCK = 360
+EPOCH_LENGTH = 360
 
 class ValidatorSession:
     def __init__(self, config):
@@ -120,6 +124,36 @@ class ValidatorSession:
             return requests
         except Exception as e:
             bt.logging.exception("Error while querying axons. \n", e)
+            return []
+    
+    def get_valid_validator_hotkeys(self):
+        valid_hotkeys = []
+        hotkeys = self.metagraph.hotkeys
+        for index, hotkey in enumerate(hotkeys):
+            if self.metagraph.total_stake[index] >= 1.024e3:
+                valid_hotkeys.append(hotkey)
+        return valid_hotkeys
+
+    def get_validator_index(self):
+        valid_hotkeys = self.get_valid_validator_hotkeys()
+        try:
+            return valid_hotkeys.index(self.wallet.hotkey.ss58_address)
+        except ValueError:
+            return -1
+    
+    def split_uids_in_batches(self, group_index, num_groups, queryable_uids):
+        num_miners = len(queryable_uids)
+        miners_per_group = num_miners // num_groups
+        remaining_miners = num_miners % num_groups
+
+        start_index = group_index * miners_per_group
+        end_index = start_index + miners_per_group
+
+        # Add remaining miners to the last group
+        if group_index == num_groups - 1:
+            end_index += remaining_miners
+
+        return queryable_uids[start_index:end_index]
 
     def get_queryable_uids(self, uids: List[int]) -> Generator[int, None, None]:
         """
@@ -345,6 +379,45 @@ class ValidatorSession:
         wandb_logger.safe_log(wandb_log)
         console.print(table)
 
+    def deterministically_shuffle_and_batch_queryable_uids(self, filtered_uids):
+        """
+        Pseudorandomly shuffles the list of queryable uids, and splits it in batches to reduce concurrent requests from multiple validators
+
+        """
+        validator_uids = self.metagraph.total_stake >= 1.024e3
+        validator_index = self.get_validator_index()
+        num_validators = (validator_uids == True).sum().item()
+
+        # batch_duration_in_blocks = (EPOCH_LENGTH / VALIDATOR_SHOULD_QUERY_EACH_BATCH_X_TIMES_PER_EPOCH) // num_validators
+        # batch_duration_in_blocks = (360 / 2) // 17 = 10
+        # thus, if there are 17 validators, they will switch groups every 10 blocks, so every ~2 minutes
+
+        # e.g. current_block = 2993336
+        # 2993336 // batch_duration_in_blocks = 2993336 // 10 = 299333
+        # (299333 + validator_index) % num_validators = (299333 + 4) % 17 = 1
+        # as validator 4, I should then query the sub group 1
+
+        batch_duration_in_blocks = int(EPOCH_LENGTH / VALIDATOR_SHOULD_QUERY_EACH_BATCH_X_TIMES_PER_EPOCH) // num_validators
+        batch_number_since_genesis = self.current_block // batch_duration_in_blocks
+        batch_index_to_query = (batch_number_since_genesis + validator_index) % num_validators
+
+        # We need to pseudorandomly shuffle the filtered_uids so that miner X isn't always in the same batch as miner Y
+        # Which would be unfair and create batches of varying speed/quality
+
+        # To avoid affecting the whole random package, we create an instance of it, which we seed
+        seed = self.current_block // PSEUDO_SHUFFLE_EVERY_X_BLOCK
+        rng = random.Random(seed)
+        shuffled_filtered_uids = list(filtered_uids[:])
+        rng.shuffle(shuffled_filtered_uids)
+
+        # Since the shuffling was seeded, all the validators will shuffle the list the exact same way
+        # without having to communicate with each other ensuring that they don't all query the same
+        # miner all at once, which can happen randomly and cause deregistrations
+
+        batched_uids = self.split_uids_in_batches(batch_index_to_query, num_validators, shuffled_filtered_uids)
+        
+        return batched_uids
+    
     def run_step(self):
         # Get the uids of all miners in the network.
         uids = self.metagraph.uids.tolist()
@@ -352,23 +425,47 @@ class ValidatorSession:
 
         requests = []
 
-        for uid in self.get_queryable_uids(uids):
+        filtered_uids = self.get_querable_uids(uids)
+
+        batched_uids = self.deterministically_shuffle_and_batch_queryable_uids(filtered_uids)
+
+        num_miners_in_batch = len(batched_uids)
+
+        # mocking the list of requests that would be sent by the API to the validator
+        lower_requests_limit = 2*num_miners_in_batch 
+        upper_requests_limit = MAX_CONCURRENT_REQUESTS*num_miners_in_batch 
+        num_concurrent_requests = random.randint(lower_requests_limit, upper_requests_limit)
+
+        proof_inputs = [random.uniform(-1, 1) for _ in range(num_concurrent_requests)]
+
+        # proof_inputs would be what the validator receives, here's how it should be split
+        # between the miners in the current batch
+
+        miner_inputs = [[] for _ in range(num_miners_in_batch)]
+
+        for i, proof_input in enumerate(proof_inputs):
+            # we split it in batches using the drawer principle / by round-robin
+            miner_inputs[i % num_miners_in_batch].append(proof_input)
+        
+        for i, uid in enumerate(batched_uids):
             axon = self.metagraph.axons[uid]
-            inputs = [random.uniform(-1, 1) for _ in range(5)]
-            synapse = protocol.QueryZkProof(
-                query_input={
-                    "model_id": [0],
-                    "public_inputs": inputs,
-                }
-            )
-            requests.append(
-                {
-                    "uid": uid,
-                    "axon": axon,
-                    "synapse": synapse,
-                    "inputs": inputs,
-                }
-            )
+            inputs_array = miner_inputs[i]
+            for inputs in inputs_array:
+                synapse = protocol.QueryZkProof(
+                    query_input={
+                        "model_id": [0],
+                        "public_inputs": inputs,
+                    }
+                )
+                requests.append(
+                    {
+                        "uid": uid,
+                        "axon": axon,
+                        "synapse": synapse,
+                        "inputs": inputs,
+                    }
+                )
+
         bt.logging.info(
             f"\033[92m >> Sending {len(requests)} queries for proofs to miners in the subnet \033[0m"
         )
